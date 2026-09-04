@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]"
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "BTCUSDT"
 THRESHOLD = 0.9975
