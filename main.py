@@ -4,8 +4,8 @@ import requests
 import time
 from datetime import datetime, timezone, timedelta
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
+TELEGRAM_TOKEN = os.environ["8609134609:AAExGA_cBZw7-HKLUfSEgXuO_6ymKrsPvXY"]
+TELEGRAM_CHAT_ID = str(os.environ["5760480316"])
 
 THRESHOLD = 0.9975
 RESULTS_FILE = "/data/results.json" if os.path.isdir("/data") else "results.json"
