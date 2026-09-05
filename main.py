@@ -4,8 +4,8 @@ import requests
 import time
 from datetime import datetime, timezone, timedelta
 
-TELEGRAM_TOKEN = os.environ["8609134609:AAExGA_cBZw7-HKLUfSEgXuO_6ymKrsPvXY"]
-TELEGRAM_CHAT_ID = str(os.environ["5760480316"])
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
 
 THRESHOLD = 0.9975
 RESULTS_FILE = "/data/results.json" if os.path.isdir("/data") else "results.json"
@@ -347,3 +347,23 @@ def run_schedule():
             trade_txt = f"\nEntry → Sun: {trade:+.2f}%" if trade is not None else ""
             lines.append(
                 f"{flag} <b>{NAMES[symbol]}</b> week {ret:+.2f}%"
+                f"{trade_txt}\n{note}\n{score_line(symbol)}"
+            )
+        send_telegram("\n\n".join(lines))
+        results["sunday_sent"] = True
+        save_results(results)
+
+print("Neo upgraded starting...")
+register_commands()
+send_telegram("🤖 <b>Neo upgraded</b>\nWednesday early report + Thursday final + /status")
+
+last_check = 0
+while True:
+    poll_telegram()
+    if time.time() - last_check >= 20 * 60:
+        try:
+            run_schedule()
+        except Exception as e:
+            print("schedule error", e)
+        last_check = time.time()
+    time.sleep(3)
