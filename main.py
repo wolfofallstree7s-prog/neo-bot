@@ -110,7 +110,7 @@ def register_commands():
     except Exception as e:
         print("commands error", e)
 
-ddef get_daily_klines(symbol, limit=14):
+def get_daily_klines(symbol, limit=14):
     candles = []
 
     # Binance.com
