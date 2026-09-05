@@ -110,16 +110,17 @@ def register_commands():
     except Exception as e:
         print("commands error", e)
 
-def get_daily_klines(symbol, limit=14):
-    # Binance
+ddef get_daily_klines(symbol, limit=14):
+    candles = []
+
+    # Binance.com
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
             params={"symbol": symbol, "interval": "1d", "limit": limit},
             timeout=15,
         ).json()
-        if isinstance(r, list) and r:
-            candles = []
+        if isinstance(r, list):
             for k in r:
                 candles.append({
                     "open_time": datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
@@ -127,25 +128,40 @@ def get_daily_klines(symbol, limit=14):
                     "low": float(k[3]),
                     "close": float(k[4]),
                 })
-            return candles
-        print("binance bad reply", symbol, r)
+            if candles:
+                return candles
+        print("binance.com", symbol, r)
     except Exception as e:
-        print("binance error", symbol, e)
+        print("binance.com error", symbol, e)
 
-    # Bybit backup
+    # Binance.US
+    try:
+        r = requests.get(
+            "https://api.binance.us/api/v3/klines",
+            params={"symbol": symbol, "interval": "1d", "limit": limit},
+            timeout=15,
+        ).json()
+        if isinstance(r, list):
+            for k in r:
+                candles.append({
+                    "open_time": datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
+                    "open": float(k[1]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                })
+            if candles:
+                return candles
+    except Exception as e:
+        print("binance.us error", symbol, e)
+
+    # Bybit
     try:
         r = requests.get(
             "https://api.bybit.com/v5/market/kline",
-            params={
-                "category": "spot",
-                "symbol": symbol,
-                "interval": "D",
-                "limit": limit,
-            },
+            params={"category": "spot", "symbol": symbol, "interval": "D", "limit": limit},
             timeout=15,
         ).json()
-        rows = r.get("result", {}).get("list", []) or []
-        candles = []
+        rows = (r.get("result") or {}).get("list") or []
         for k in rows:
             candles.append({
                 "open_time": datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc),
@@ -154,10 +170,37 @@ def get_daily_klines(symbol, limit=14):
                 "close": float(k[4]),
             })
         candles.sort(key=lambda x: x["open_time"])
-        return candles
+        if candles:
+            return candles
+        print("bybit", symbol, r)
     except Exception as e:
         print("bybit error", symbol, e)
-        return []
+
+    # OKX
+    try:
+        inst = symbol.replace("USDT", "-USDT")
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/candles",
+            params={"instId": inst, "bar": "1D", "limit": str(limit)},
+            timeout=15,
+        ).json()
+        rows = r.get("data") or []
+        out = []
+        for k in rows:
+            out.append({
+                "open_time": datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc),
+                "open": float(k[1]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+            })
+        out.sort(key=lambda x: x["open_time"])
+        if out:
+            return out
+        print("okx", symbol, r)
+    except Exception as e:
+        print("okx error", symbol, e)
+
+    return []
 
 def snapshot():
     now = datetime.now(timezone.utc)
