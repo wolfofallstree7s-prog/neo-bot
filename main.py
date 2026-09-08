@@ -10,6 +10,7 @@ TELEGRAM_CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
 LONG_OK = 0.9975
 SHORT_OK = 1.0025
 RESULTS_FILE = "/data/results.json" if os.path.isdir("/data") else "results.json"
+BOT_NAME = "Neo"
 
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT",
@@ -29,6 +30,20 @@ HIST_SHORT = {
     "BTCUSDT": (22, 23), "ETHUSDT": (21, 23), "BNBUSDT": (17, 19),
     "LTCUSDT": (19, 22), "DOGEUSDT": (19, 20), "SOLUSDT": (8, 9),
     "XRPUSDT": (16, 18),
+}
+
+BANDS = (0.25, 0.50, 0.75, 1.00)
+OK_LONG = {
+    0.25: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
+    0.50: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
+    0.75: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
+    1.00: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
+}
+OK_SHORT = {
+    0.25: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
+    0.50: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
+    0.75: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
+    1.00: {"BTCUSDT", "BNBUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
 }
 
 update_offset = 0
@@ -171,11 +186,40 @@ def score_line(symbol):
         f"short {sw}/{st} | live {c['short_wins']}/{c['short_total']}"
     )
 
+def band_blocks(data):
+    blocks = []
+    for thr in BANDS:
+        lines = [f"<b>{BOT_NAME} {thr:.2f}%</b>"]
+        any_line = False
+        for s in SYMBOLS:
+            if s not in data:
+                continue
+            d = data[s]
+            long_ok = d["low"] >= d["open"] * (1 - thr / 100)
+            short_ok = d["high"] <= d["open"] * (1 + thr / 100)
+            show_long = long_ok and s in OK_LONG[thr]
+            show_short = short_ok and s in OK_SHORT[thr]
+            if show_long and show_short:
+                tag = "⚪ INSIDE"
+            elif show_long:
+                tag = "🟢 LONG"
+            elif show_short:
+                tag = "🔴 SHORT"
+            else:
+                continue
+            any_line = True
+            lines.append(
+                f"{tag} {NAMES[s]}  dip {d['dip']:.2f}% | rally {d['rally']:.2f}%"
+            )
+        if any_line:
+            blocks.append("\n".join(lines))
+    return blocks
+
 def handle_command(text):
     cmd = text.strip().lower()
     if cmd.startswith("/status"):
         _, data = snapshot()
-        lines = ["<b>Neo status</b>"]
+        lines = [f"<b>{BOT_NAME} status</b>  official = 0.25%"]
         for s in SYMBOLS:
             if s not in data:
                 lines.append(f"⚪ {NAMES[s]} no data")
@@ -187,14 +231,15 @@ def handle_command(text):
                 f"Open ${d['open']:,.4f} | Low ${d['low']:,.4f} | High ${d['high']:,.4f}\n"
                 f"Dip {d['dip']:.2f}% | Rally {d['rally']:.2f}%"
             )
-        send_telegram("\n\n".join(lines))
+        extra = band_blocks(data)
+        send_telegram("\n\n".join(lines + extra))
     elif cmd.startswith("/score"):
-        send_telegram("<b>Scores</b>\n" + "\n".join(score_line(s) for s in SYMBOLS))
-    elif cmd.startswith("/help") or cmd.startswith("/start"):
+        send_telegram("<b>Scores 0.25% only</b>\n" + "\n".join(score_line(s) for s in SYMBOLS))
+    else:
         send_telegram(
-            "<b>Neo</b>\n"
-            "LONG: week low never -0.25% under Monday open\n"
-            "SHORT: week high never +0.25% over Monday open\n"
+            f"<b>{BOT_NAME}</b>\n"
+            "Official confirm = 0.25%\n"
+            "Also tracks 0.50 / 0.75 / 1.00 if win rate ≥ 88%\n"
             "Wednesday early / Thursday final / Sunday report\n"
             "/status /score"
         )
@@ -235,16 +280,23 @@ def run_schedule():
         save_results(results)
 
     if not results["monday_sent"]:
-        lines = ["<b>New week</b>"]
+        lines = [f"<b>{BOT_NAME} new week</b>"]
         for s in SYMBOLS:
-            if s in data:
-                lines.append(f"{NAMES[s]} open ${data[s]['open']:,.4f}")
-        send_telegram("\n".join(lines))
-        results["monday_sent"] = True
-        save_results(results)
+            if s not in data:
+                continue
+            o = data[s]["open"]
+            lines.append(
+                f"{NAMES[s]} open ${o:,.4f}\n"
+                f"Long needs low ≥ ${o * LONG_OK:,.4f} (−0.25%)\n"
+                f"Short needs high ≤ ${o * SHORT_OK:,.4f} (+0.25%)"
+            )
+        if len(lines) > 1:
+            send_telegram("\n\n".join(lines))
+            results["monday_sent"] = True
+            save_results(results)
 
     if now.weekday() == 2 and now.hour >= 18 and not results["wednesday_sent"]:
-        lines = ["<b>Wednesday early report</b>"]
+        lines = [f"<b>{BOT_NAME} Wednesday early</b>  official 0.25%"]
         for s in SYMBOLS:
             if s not in data:
                 continue
@@ -256,13 +308,13 @@ def run_schedule():
                 results["coins"][s]["entry"] = d["close"]
                 lines.append(f"🔴 {NAMES[s]} EARLY SHORT\nRally {d['rally']:.2f}%")
             else:
-                lines.append(f"⚪ {NAMES[s]} no early setup")
-        send_telegram("\n\n".join(lines))
+                lines.append(f"⚪ {NAMES[s]} no early 0.25% setup")
+        send_telegram("\n\n".join(lines + band_blocks(data)))
         results["wednesday_sent"] = True
         save_results(results)
 
     if now.weekday() == 3 and now.hour >= 18 and not results["thursday_sent"]:
-        lines = ["<b>Thursday final report</b>"]
+        lines = [f"<b>{BOT_NAME} Thursday final</b>  official 0.25%"]
         for s in SYMBOLS:
             if s not in data:
                 continue
@@ -284,12 +336,12 @@ def run_schedule():
                 c["pending_long"] = False
                 c["pending_short"] = False
                 lines.append(f"⚪ {NAMES[s]} NO SETUP")
-        send_telegram("\n\n".join(lines))
+        send_telegram("\n\n".join(lines + band_blocks(data)))
         results["thursday_sent"] = True
         save_results(results)
 
     if now.weekday() == 6 and now.hour >= 20 and not results["sunday_sent"]:
-        lines = ["<b>Sunday report</b>"]
+        lines = [f"<b>{BOT_NAME} Sunday report</b>  0.25% live score"]
         for s in SYMBOLS:
             if s not in data:
                 continue
@@ -307,18 +359,20 @@ def run_schedule():
                     c["short_wins"] += 1
                 note = "short live score updated"
             else:
-                note = "no Thursday setup"
+                note = "no Thursday 0.25% setup"
             c["pending_long"] = False
             c["pending_short"] = False
-            lines.append(
-                f"{NAMES[s]} week {week_ret:+.2f}%\n{note}\n{score_line(s)}"
-            )
+            lines.append(f"{NAMES[s]} week {week_ret:+.2f}%\n{note}\n{score_line(s)}")
         send_telegram("\n\n".join(lines))
         results["sunday_sent"] = True
         save_results(results)
 
-print("Neo long+short starting")
-send_telegram("🤖 <b>Neo updated</b>\nLong + short filters. /status /score")
+print("Neo long+short + bands starting")
+send_telegram(
+    f"🤖 <b>{BOT_NAME} updated</b>\n"
+    "Official 0.25% + watch bands 0.50 / 0.75 / 1.00 (≥88%)\n"
+    "/status /score"
+)
 
 last_check = 0
 while True:
