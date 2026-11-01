@@ -62,6 +62,17 @@ HIST_SEED = {
     "XRP":  {"long_w": 8,  "long_n": 9,  "short_w": 16, "short_n": 18},
 }
 
+# Live book before upgrade reset — restored once on next deploy
+LIVE_SEED = {
+    "BTC":  {"long_w": 0, "long_n": 0, "short_w": 1, "short_n": 1},
+    "ETH":  {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0},
+    "BNB":  {"long_w": 1, "long_n": 1, "short_w": 0, "short_n": 0},
+    "LTC":  {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0},
+    "DOGE": {"long_w": 1, "long_n": 1, "short_w": 0, "short_n": 0},
+    "SOL":  {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0},
+    "XRP":  {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0},
+}
+
 
 # ─── helpers ───────────────────────────────────────────────────────────────
 
@@ -93,11 +104,25 @@ def load_results():
     r = load_json(RESULTS_FILE, {})
     if "hist" not in r:
         r["hist"] = {k: dict(v) for k, v in HIST_SEED.items()}
+    # ensure every coin exists in hist
+    for name, seed in HIST_SEED.items():
+        r.setdefault("hist", {}).setdefault(name, dict(seed))
+
     if "live" not in r:
-        r["live"] = {
-            name: {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0}
-            for name in SYMBOLS.values()
-        }
+        r["live"] = {name: dict(v) for name, v in LIVE_SEED.items()}
+
+    # One-time restore after upgrade wiped live to 0/0
+    meta = r.setdefault("meta", {})
+    if not meta.get("live_restored_v1"):
+        r["live"] = {name: dict(v) for name, v in LIVE_SEED.items()}
+        meta["live_restored_v1"] = True
+
+    # ensure every coin exists in live
+    for name in SYMBOLS.values():
+        r.setdefault("live", {}).setdefault(
+            name, {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0}
+        )
+
     if "weeks" not in r:
         r["weeks"] = {}
     if "journal" not in r:
