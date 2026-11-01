@@ -1,386 +1,655 @@
+"""
+Neo — crypto weekly structure alert bot
+All upgrades: Binance klines, retries, heartbeat, journal, EXTENDED/invalidation,
+STRUCTURE vs TRADE, de-spammed bands, fail alerts, webhook clear, live-from-stored-opens
+"""
 import os
 import json
-import requests
 import time
+import requests
 from datetime import datetime, timezone, timedelta
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
-
-LONG_OK = 0.9975
-SHORT_OK = 1.0025
-RESULTS_FILE = "/data/results.json" if os.path.isdir("/data") else "results.json"
 BOT_NAME = "Neo"
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+DATA_DIR = "/data"
+RESULTS_FILE = os.path.join(DATA_DIR, "results.json")
+HEARTBEAT_FILE = os.path.join(DATA_DIR, "heartbeat.json")
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT",
-    "DOGEUSDT", "SOLUSDT", "XRPUSDT",
-]
-NAMES = {
-    "BTCUSDT": "BTC", "ETHUSDT": "ETH", "BNBUSDT": "BNB",
-    "LTCUSDT": "LTC", "DOGEUSDT": "DOGE", "SOLUSDT": "SOL",
+# Binance spot symbols (what you actually trade)
+SYMBOLS = {
+    "BTCUSDT": "BTC",
+    "ETHUSDT": "ETH",
+    "BNBUSDT": "BNB",
+    "LTCUSDT": "LTC",
+    "DOGEUSDT": "DOGE",
+    "SOLUSDT": "SOL",
     "XRPUSDT": "XRP",
 }
-HIST_LONG = {
-    "BTCUSDT": (21, 21), "ETHUSDT": (13, 14), "BNBUSDT": (16, 16),
-    "LTCUSDT": (9, 9), "DOGEUSDT": (8, 8), "SOLUSDT": (7, 8),
-    "XRPUSDT": (8, 9),
-}
-HIST_SHORT = {
-    "BTCUSDT": (22, 23), "ETHUSDT": (21, 23), "BNBUSDT": (17, 19),
-    "LTCUSDT": (19, 22), "DOGEUSDT": (19, 20), "SOLUSDT": (8, 9),
-    "XRPUSDT": (16, 18),
+
+OFFICIAL = 0.25
+BANDS = [0.25, 0.50, 0.75, 1.00]
+EXTENDED_PCT = 5.0          # structure OK but already ran this much → EXTENDED
+SKIP_EXTENDED_PCT = 8.0     # no new risk language above this
+HEARTBEAT_HOURS = 6
+STALE_HOURS = 2
+POLL_SLEEP = 60
+
+# Historical seeds (your research sample) — live book is separate
+HIST_SEED = {
+    "BTC":  {"long_w": 21, "long_n": 21, "short_w": 22, "short_n": 23},
+    "ETH":  {"long_w": 13, "long_n": 14, "short_w": 21, "short_n": 23},
+    "BNB":  {"long_w": 16, "long_n": 16, "short_w": 17, "short_n": 19},
+    "LTC":  {"long_w": 9,  "long_n": 9,  "short_w": 19, "short_n": 22},
+    "DOGE": {"long_w": 8,  "long_n": 8,  "short_w": 19, "short_n": 20},
+    "SOL":  {"long_w": 7,  "long_n": 8,  "short_w": 8,  "short_n": 9},
+    "XRP":  {"long_w": 8,  "long_n": 9,  "short_w": 16, "short_n": 18},
 }
 
-BANDS = (0.25, 0.50, 0.75, 1.00)
-OK_LONG = {
-    0.25: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
-    0.50: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
-    0.75: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
-    1.00: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "XRPUSDT"},
-}
-OK_SHORT = {
-    0.25: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
-    0.50: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "LTCUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
-    0.75: {"BTCUSDT", "ETHUSDT", "BNBUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
-    1.00: {"BTCUSDT", "BNBUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"},
-}
 
-update_offset = 0
+# ─── helpers ───────────────────────────────────────────────────────────────
 
-def send_telegram(message):
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=15,
-        )
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
     except Exception as e:
-        print("Telegram error:", e)
+        print("load_json", path, e)
+    return default
 
-def empty_coin():
-    return {
-        "pending_long": False,
-        "pending_short": False,
-        "entry": None,
-        "long_wins": 0, "long_total": 0,
-        "short_wins": 0, "short_total": 0,
-    }
+
+def save_json(path, obj):
+    ensure_data_dir()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
 
 def load_results():
-    default = {
-        "week": None,
-        "monday_sent": False,
-        "wednesday_sent": False,
-        "thursday_sent": False,
-        "sunday_sent": False,
-        "coins": {s: empty_coin() for s in SYMBOLS},
-    }
-    if not os.path.exists(RESULTS_FILE):
-        return default
-    try:
-        with open(RESULTS_FILE, "r") as f:
-            data = json.load(f)
-    except Exception:
-        return default
-    for k, v in default.items():
-        data.setdefault(k, v)
-    data.setdefault("coins", {})
-    for s in SYMBOLS:
-        data["coins"].setdefault(s, empty_coin())
-        for kk, vv in empty_coin().items():
-            data["coins"][s].setdefault(kk, vv)
-    return data
-
-def save_results(data):
-    folder = os.path.dirname(RESULTS_FILE)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    with open(RESULTS_FILE, "w") as f:
-        json.dump(data, f)
-
-results = load_results()
-
-def get_daily_klines(symbol, limit=14):
-    sources = [
-        ("https://api.binance.com/api/v3/klines",
-         {"symbol": symbol, "interval": "1d", "limit": limit}, "binance"),
-        ("https://api.binance.us/api/v3/klines",
-         {"symbol": symbol, "interval": "1d", "limit": limit}, "binanceus"),
-    ]
-    for url, params, name in sources:
-        try:
-            r = requests.get(url, params=params, timeout=15).json()
-            if isinstance(r, list) and r:
-                return [{
-                    "open_time": datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                } for k in r]
-        except Exception as e:
-            print(name, symbol, e)
-    try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/kline",
-            params={"category": "spot", "symbol": symbol, "interval": "D", "limit": limit},
-            timeout=15,
-        ).json()
-        rows = (r.get("result") or {}).get("list") or []
-        candles = [{
-            "open_time": datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-        } for k in rows]
-        candles.sort(key=lambda x: x["open_time"])
-        if candles:
-            return candles
-    except Exception as e:
-        print("bybit", symbol, e)
-    return []
-
-def snapshot():
-    now = datetime.now(timezone.utc)
-    this_monday = (now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    out = {}
-    for symbol in SYMBOLS:
-        candles = get_daily_klines(symbol)
-        monday = None
-        lows, highs = [], []
-        close = None
-        for c in candles:
-            if c["open_time"].date() == this_monday.date():
-                monday = c
-            if c["open_time"] >= this_monday:
-                lows.append(c["low"])
-                highs.append(c["high"])
-                close = c["close"]
-        if not monday or not lows:
-            continue
-        o = monday["open"]
-        low, high = min(lows), max(highs)
-        out[symbol] = {
-            "open": o,
-            "low": low,
-            "high": high,
-            "close": close,
-            "dip": (o - low) / o * 100,
-            "rally": (high - o) / o * 100,
-            "long_ok": low >= o * LONG_OK,
-            "short_ok": high <= o * SHORT_OK,
+    r = load_json(RESULTS_FILE, {})
+    if "hist" not in r:
+        r["hist"] = {k: dict(v) for k, v in HIST_SEED.items()}
+    if "live" not in r:
+        r["live"] = {
+            name: {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0}
+            for name in SYMBOLS.values()
         }
-        time.sleep(0.25)
-    return this_monday, out
+    if "weeks" not in r:
+        r["weeks"] = {}
+    if "journal" not in r:
+        r["journal"] = []
+    return r
 
-def score_line(symbol):
-    lw, lt = HIST_LONG[symbol]
-    sw, st = HIST_SHORT[symbol]
-    c = results["coins"][symbol]
+
+def save_results(r):
+    save_json(RESULTS_FILE, r)
+
+
+def touch_heartbeat(ok=True, note=""):
+    save_json(HEARTBEAT_FILE, {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "ok": ok,
+        "note": note,
+    })
+
+
+def check_stale_heartbeat(results):
+    """If last successful loop is too old, alert once per incident."""
+    hb = load_json(HEARTBEAT_FILE, {})
+    ts = hb.get("ts")
+    if not ts:
+        return
+    try:
+        last = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+    except Exception:
+        return
+    age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+    flag = results.setdefault("meta", {})
+    if age_h >= STALE_HOURS and not flag.get("stale_alerted"):
+        send_telegram(
+            f"⚠️ <b>{BOT_NAME}</b> heartbeat stale ({age_h:.1f}h). "
+            f"Check Railway logs / process."
+        )
+        flag["stale_alerted"] = True
+        save_results(results)
+    elif age_h < STALE_HOURS and flag.get("stale_alerted"):
+        flag["stale_alerted"] = False
+        save_results(results)
+
+
+def week_key(dt: datetime) -> str:
+    d = dt.date()
+    monday = d - timedelta(days=d.weekday())
+    return monday.isoformat()
+
+
+def retry(fn, tries=3, delay=2, label=""):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            print(f"retry {label} {i+1}/{tries}: {e}")
+            time.sleep(delay * (i + 1))
+    raise last if last else RuntimeError("retry failed")
+
+
+def send_telegram(text: str):
+    def _send():
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        r = requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": text[:4000],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=25,
+        )
+        r.raise_for_status()
+        return r
+
+    try:
+        retry(_send, tries=3, delay=2, label="telegram")
+    except Exception as e:
+        print("telegram hard fail", e)
+
+
+def delete_webhook():
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": False},
+            timeout=15,
+        )
+    except Exception as e:
+        print("deleteWebhook", e)
+
+
+# ─── Binance data ──────────────────────────────────────────────────────────
+
+def fetch_binance_klines(symbol: str, interval="1d", limit=14):
+    def _fetch():
+        url = "https://api.binance.com/api/v3/klines"
+        r = requests.get(
+            url,
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=25,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            raise ValueError(f"empty klines {symbol}")
+        return data
+
+    return retry(_fetch, tries=3, delay=2, label=f"binance {symbol}")
+
+
+def kline_row(k):
+    # [open_time, open, high, low, close, ...]
+    return {
+        "open_time": int(k[0]),
+        "open": float(k[1]),
+        "high": float(k[2]),
+        "low": float(k[3]),
+        "close": float(k[4]),
+    }
+
+
+def snapshot_week():
+    """
+    For each symbol return week structure based on UTC daily candles.
+    Monday open = open of the Monday daily candle of current ISO week.
+    High/low = max/min from Monday through latest available daily bar
+    (in-progress today included — labeled in messages).
+    """
+    now = datetime.now(timezone.utc)
+    wk = week_key(now)
+    monday_date = datetime.fromisoformat(wk).date()
+    out = {}
+    errors = []
+
+    for sym, name in SYMBOLS.items():
+        try:
+            raw = fetch_binance_klines(sym, "1d", 21)
+            rows = [kline_row(k) for k in raw]
+            # map by UTC date
+            by_day = {}
+            for row in rows:
+                d = datetime.fromtimestamp(row["open_time"] / 1000, tz=timezone.utc).date()
+                by_day[d] = row
+
+            if monday_date not in by_day:
+                # fallback: first candle on/after monday in this week
+                candidates = [d for d in by_day if d >= monday_date and d <= monday_date + timedelta(days=6)]
+                if not candidates:
+                    errors.append(name)
+                    continue
+                mon_d = min(candidates)
+            else:
+                mon_d = monday_date
+
+            mon_open = by_day[mon_d]["open"]
+            days = [monday_date + timedelta(days=i) for i in range(7)]
+            highs, lows, last_close, last_ts = [], [], None, None
+            for d in days:
+                if d in by_day:
+                    highs.append(by_day[d]["high"])
+                    lows.append(by_day[d]["low"])
+                    last_close = by_day[d]["close"]
+                    last_ts = by_day[d]["open_time"]
+            if not highs:
+                errors.append(name)
+                continue
+
+            out[sym] = {
+                "name": name,
+                "open": mon_open,
+                "high": max(highs),
+                "low": min(lows),
+                "close": last_close,
+                "bar_ts": last_ts,
+                "monday_date": mon_d.isoformat(),
+            }
+        except Exception as e:
+            print("snapshot", sym, e)
+            errors.append(name)
+
+    return out, errors
+
+
+# ─── structure math ─────────────────────────────────────────────────────────
+
+def band_side(o, lo, hi, thr):
+    long_ok = lo >= o * (1 - thr / 100)
+    short_ok = hi <= o * (1 + thr / 100)
+    if long_ok and not short_ok:
+        return "LONG"
+    if short_ok and not long_ok:
+        return "SHORT"
+    if long_ok and short_ok:
+        return "BOTH"
+    return "NONE"
+
+
+def extension_note(o, lo, hi, side):
+    dip = (o - lo) / o * 100
+    rally = (hi - o) / o * 100
+    if side == "LONG":
+        ext = rally
+    elif side == "SHORT":
+        ext = dip
+    else:
+        ext = max(dip, rally)
+    if ext >= SKIP_EXTENDED_PCT:
+        return ext, "SKIP_EXTENDED"
+    if ext >= EXTENDED_PCT:
+        return ext, "EXTENDED"
+    return ext, "OK"
+
+
+def inv_prices(o):
+    return o * (1 - OFFICIAL / 100), o * (1 + OFFICIAL / 100)
+
+
+def fmt_p(x):
+    if x >= 100:
+        return f"${x:,.2f}"
+    if x >= 1:
+        return f"${x:,.4f}"
+    return f"${x:,.6f}"
+
+
+def asof_line():
+    now = datetime.now(timezone.utc)
+    return f"<i>as-of {now.strftime('%Y-%m-%d %H:%M')} UTC (day may be open)</i>"
+
+
+def risk_footer():
     return (
-        f"{NAMES[symbol]} long {lw}/{lt} | live {c['long_wins']}/{c['long_total']} || "
-        f"short {sw}/{st} | live {c['short_wins']}/{c['short_total']}"
+        "\n\n<i>Manual risk: ≤1% account to invalidation · "
+        "1–2 theme positions · flat by Sunday · "
+        "if already extended → half size or skip</i>"
     )
 
-def band_blocks(data):
-    blocks = []
-    for thr in BANDS:
-        lines = [f"<b>{BOT_NAME} {thr:.2f}%</b>"]
-        any_line = False
-        for s in SYMBOLS:
-            if s not in data:
-                continue
-            d = data[s]
-            long_ok = d["low"] >= d["open"] * (1 - thr / 100)
-            short_ok = d["high"] <= d["open"] * (1 + thr / 100)
-            show_long = long_ok and s in OK_LONG[thr]
-            show_short = short_ok and s in OK_SHORT[thr]
-            if show_long and show_short:
-                tag = "⚪ INSIDE"
-            elif show_long:
-                tag = "🟢 LONG"
-            elif show_short:
-                tag = "🔴 SHORT"
-            else:
-                continue
-            any_line = True
-            lines.append(
-                f"{tag} {NAMES[s]}  dip {d['dip']:.2f}% | rally {d['rally']:.2f}%"
-            )
-        if any_line:
-            blocks.append("\n".join(lines))
-    return blocks
 
-def handle_command(text):
-    cmd = text.strip().lower()
-    if cmd.startswith("/status"):
-        _, data = snapshot()
-        lines = [f"<b>{BOT_NAME} status</b>  official = 0.25%"]
-        for s in SYMBOLS:
-            if s not in data:
-                lines.append(f"⚪ {NAMES[s]} no data")
-                continue
-            d = data[s]
-            tag = "🟢 LONG" if d["long_ok"] else ("🔴 SHORT" if d["short_ok"] else "⚪ NONE")
+# ─── messages ──────────────────────────────────────────────────────────────
+
+def monday_message(data):
+    lines = [f"<b>{BOT_NAME} new week</b>", asof_line()]
+    for sym, name in SYMBOLS.items():
+        if sym not in data:
+            lines.append(f"{name}: no data")
+            continue
+        o = data[sym]["open"]
+        lo_need, hi_need = inv_prices(o)
+        lines.append(
+            f"<b>{name}</b> open {fmt_p(o)}\n"
+            f"Long needs low ≥ {fmt_p(lo_need)} (−{OFFICIAL}%)\n"
+            f"Short needs high ≤ {fmt_p(hi_need)} (+{OFFICIAL}%)\n"
+            f"Invalidation L {fmt_p(lo_need)} · S {fmt_p(hi_need)}"
+        )
+    lines.append(risk_footer())
+    return "\n\n".join(lines)
+
+
+def structure_block(data, title, opens=None):
+    """Official 0.25% STRUCTURE + TRADE tag."""
+    lines = [
+        f"<b>{BOT_NAME} {title}</b>  official {OFFICIAL}%",
+        asof_line(),
+    ]
+    for sym, name in SYMBOLS.items():
+        if sym not in data:
+            lines.append(f"⚪ {name} no data")
+            continue
+        o = opens.get(sym, data[sym]["open"]) if opens else data[sym]["open"]
+        lo = data[sym]["low"]
+        hi = data[sym]["high"]
+        dip = (o - lo) / o * 100
+        rally = (hi - o) / o * 100
+        side = band_side(o, lo, hi, OFFICIAL)
+        ext, tag = extension_note(o, lo, hi, side)
+        inv_l, inv_s = inv_prices(o)
+        icon = {"LONG": "🟢", "SHORT": "🔴", "BOTH": "🟡", "NONE": "⚪"}.get(side, "⚪")
+
+        if side == "NONE":
             lines.append(
-                f"{tag} <b>{NAMES[s]}</b>\n"
-                f"Open ${d['open']:,.4f} | Low ${d['low']:,.4f} | High ${d['high']:,.4f}\n"
-                f"Dip {d['dip']:.2f}% | Rally {d['rally']:.2f}%"
+                f"{icon} <b>{name}</b> NO SETUP\n"
+                f"dip {dip:.2f}% | rally {rally:.2f}%\n"
+                f"STRUCTURE: none · TRADE: none"
             )
-        extra = band_blocks(data)
-        send_telegram("\n\n".join(lines + extra))
-    elif cmd.startswith("/score"):
-        send_telegram("<b>Scores 0.25% only</b>\n" + "\n".join(score_line(s) for s in SYMBOLS))
-    else:
-        send_telegram(
-            f"<b>{BOT_NAME}</b>\n"
-            "Official confirm = 0.25%\n"
-            "Also tracks 0.50 / 0.75 / 1.00 if win rate ≥ 88%\n"
-            "Wednesday early / Thursday final / Sunday report\n"
-            "/status /score"
+        else:
+            trade = "consider"
+            if tag == "EXTENDED":
+                trade = "EXTENDED — half size / pullback only"
+            elif tag == "SKIP_EXTENDED":
+                trade = "SKIP_EXTENDED — structure only, no new risk"
+            lines.append(
+                f"{icon} <b>{name}</b> {side}\n"
+                f"dip {dip:.2f}% | rally {rally:.2f}% | ext {ext:.2f}%\n"
+                f"STRUCTURE: {side} OK · TRADE: {trade}\n"
+                f"Inv L {fmt_p(inv_l)} · S {fmt_p(inv_s)}"
+            )
+    lines.append(risk_footer())
+    return "\n\n".join(lines)
+
+
+def bands_block(data, opens=None):
+    """Multi-band on demand only (/bands)."""
+    lines = [f"<b>{BOT_NAME} all bands</b>", asof_line()]
+    for thr in BANDS:
+        chunk = [f"<b>{thr:.2f}%</b>"]
+        for sym, name in SYMBOLS.items():
+            if sym not in data:
+                continue
+            o = opens.get(sym, data[sym]["open"]) if opens else data[sym]["open"]
+            side = band_side(o, data[sym]["low"], data[sym]["high"], thr)
+            if side in ("LONG", "SHORT", "BOTH"):
+                icon = {"LONG": "🟢", "SHORT": "🔴", "BOTH": "🟡"}[side]
+                chunk.append(f"{icon} {name} {side}")
+        if len(chunk) == 1:
+            chunk.append("none")
+        lines.append("\n".join(chunk))
+    return "\n\n".join(lines)
+
+
+def sunday_message(data, results, opens):
+    lines = [f"<b>{BOT_NAME} Sunday report</b>  {OFFICIAL}% live score", asof_line()]
+    wk = results.get("current_week", "")
+    week = results.setdefault("weeks", {}).setdefault(wk, {})
+
+    for sym, name in SYMBOLS.items():
+        if sym not in data:
+            lines.append(f"{name}: no data")
+            continue
+        o = opens.get(sym, data[sym]["open"])
+        c = data[sym]["close"]
+        ret = (c - o) / o * 100
+        conf = week.get(sym, {}).get("thu_confirm")
+        live = results["live"].setdefault(
+            name, {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0}
+        )
+        hist = results["hist"].setdefault(
+            name, {"long_w": 0, "long_n": 0, "short_w": 0, "short_n": 0}
         )
 
-def poll_telegram():
-    global update_offset
+        # score only once
+        scored = week.get(sym, {}).get("scored", False)
+        note = "no Thursday 0.25% setup"
+        if not scored and conf in ("LONG", "SHORT"):
+            if conf == "LONG":
+                live["long_n"] += 1
+                if c > o:
+                    live["long_w"] += 1
+                    note = "long live updated"
+                else:
+                    note = "long live updated (loss)"
+            else:
+                live["short_n"] += 1
+                if c < o:
+                    live["short_w"] += 1
+                    note = "short live updated"
+                else:
+                    note = "short live updated (loss)"
+            week.setdefault(sym, {})["scored"] = True
+            results.setdefault("journal", []).append({
+                "week": wk,
+                "pair": name,
+                "side": conf,
+                "open": o,
+                "close": c,
+                "ret_pct": ret,
+                "win": (c > o) if conf == "LONG" else (c < o),
+                "venue": "binance",
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+        elif scored:
+            note = "already scored"
+        elif conf:
+            note = f"thu was {conf}"
+
+        lines.append(
+            f"{name} week {ret:+.2f}%\n{note}\n"
+            f"{name} long {hist.get('long_w', 0)}/{hist.get('long_n', 0)} "
+            f"live {live['long_w']}/{live['long_n']} || "
+            f"short {hist.get('short_w', 0)}/{hist.get('short_n', 0)} "
+            f"live {live['short_w']}/{live['short_n']}"
+        )
+    return "\n\n".join(lines)
+
+
+def scores_message(results):
+    lines = [f"<b>{BOT_NAME} scores</b> {OFFICIAL}% only"]
+    for name in SYMBOLS.values():
+        h = results.get("hist", {}).get(name, {})
+        lv = results.get("live", {}).get(name, {})
+        lines.append(
+            f"{name} long {h.get('long_w', 0)}/{h.get('long_n', 0)} | "
+            f"live {lv.get('long_w', 0)}/{lv.get('long_n', 0)} || "
+            f"short {h.get('short_w', 0)}/{h.get('short_n', 0)} | "
+            f"live {lv.get('short_w', 0)}/{lv.get('short_n', 0)}"
+        )
+    return "\n".join(lines)
+
+
+# ─── telegram poll ─────────────────────────────────────────────────────────
+
+def poll_commands(results):
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-            params={"timeout": 0, "offset": update_offset},
-            timeout=15,
-        ).json()
-        for upd in r.get("result", []):
-            update_offset = upd["update_id"] + 1
+        r = requests.get(url, params={"timeout": 0}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        for upd in data.get("result", []):
             msg = upd.get("message") or {}
-            if str(msg.get("chat", {}).get("id")) != TELEGRAM_CHAT_ID:
+            text = (msg.get("text") or "").strip().lower()
+            chat = str((msg.get("chat") or {}).get("id", ""))
+            if chat and chat != str(CHAT_ID):
+                # ignore other chats
+                rid = upd["update_id"]
+                requests.get(url, params={"offset": rid + 1}, timeout=10)
                 continue
-            text = msg.get("text") or ""
-            if text.startswith("/"):
-                handle_command(text)
+
+            snap, errs = snapshot_week()
+            wk = results.get("weeks", {}).get(results.get("current_week", {}), {})
+            opens = wk.get("opens") or {s: snap[s]["open"] for s in snap}
+
+            if text in ("/status", "/start", "/help"):
+                if errs:
+                    send_telegram(f"⚠️ data fail: {', '.join(errs)}")
+                send_telegram(structure_block(snap, "status", opens))
+                send_telegram(
+                    "/status structure · /scores live+hist · /bands all % · /journal last 5"
+                )
+            elif text in ("/scores", "/score"):
+                send_telegram(scores_message(results))
+            elif text == "/bands":
+                send_telegram(bands_block(snap, opens))
+            elif text == "/journal":
+                j = results.get("journal", [])[-5:]
+                if not j:
+                    send_telegram("journal empty")
+                else:
+                    lines = [f"<b>{BOT_NAME} journal (last 5)</b>"]
+                    for row in j:
+                        lines.append(
+                            f"{row.get('week')} {row.get('pair')} {row.get('side')} "
+                            f"{row.get('ret_pct', 0):+.2f}% "
+                            f"{'WIN' if row.get('win') else 'LOSS'}"
+                        )
+                    send_telegram("\n".join(lines))
+
+            rid = upd["update_id"]
+            requests.get(url, params={"offset": rid + 1}, timeout=10)
     except Exception as e:
-        print("poll error", e)
+        print("poll", e)
 
-def run_schedule():
+
+# ─── schedule ──────────────────────────────────────────────────────────────
+
+def run_once(results):
     now = datetime.now(timezone.utc)
-    this_monday, data = snapshot()
-    week_key = this_monday.strftime("%Y-%m-%d")
-    if results.get("week") != week_key:
-        results["week"] = week_key
-        results["monday_sent"] = False
-        results["wednesday_sent"] = False
-        results["thursday_sent"] = False
-        results["sunday_sent"] = False
-        for s in SYMBOLS:
-            results["coins"][s]["pending_long"] = False
-            results["coins"][s]["pending_short"] = False
-            results["coins"][s]["entry"] = None
-        save_results(results)
+    wk = week_key(now)
+    results["current_week"] = wk
+    week = results.setdefault("weeks", {}).setdefault(wk, {})
+    week.setdefault("monday_sent", False)
+    week.setdefault("wed_sent", False)
+    week.setdefault("thu_sent", False)
+    week.setdefault("sun_sent", False)
 
-    if not results["monday_sent"]:
-        lines = [f"<b>{BOT_NAME} new week</b>"]
-        for s in SYMBOLS:
-            if s not in data:
-                continue
-            o = data[s]["open"]
-            lines.append(
-                f"{NAMES[s]} open ${o:,.4f}\n"
-                f"Long needs low ≥ ${o * LONG_OK:,.4f} (−0.25%)\n"
-                f"Short needs high ≤ ${o * SHORT_OK:,.4f} (+0.25%)"
+    data, errors = snapshot_week()
+    if errors:
+        # only spam once per hour max
+        meta = results.setdefault("meta", {})
+        last = meta.get("last_err_alert", 0)
+        if time.time() - last > 3600:
+            send_telegram(
+                f"⚠️ <b>{BOT_NAME}</b> data fail this check: {', '.join(errors)}"
             )
-        if len(lines) > 1:
-            send_telegram("\n\n".join(lines))
-            results["monday_sent"] = True
+            meta["last_err_alert"] = time.time()
             save_results(results)
 
-    if now.weekday() == 2 and now.hour >= 18 and not results["wednesday_sent"]:
-        lines = [f"<b>{BOT_NAME} Wednesday early</b>  official 0.25%"]
-        for s in SYMBOLS:
-            if s not in data:
-                continue
-            d = data[s]
-            if d["long_ok"]:
-                results["coins"][s]["entry"] = d["close"]
-                lines.append(f"🟢 {NAMES[s]} EARLY LONG\nDip {d['dip']:.2f}%")
-            elif d["short_ok"]:
-                results["coins"][s]["entry"] = d["close"]
-                lines.append(f"🔴 {NAMES[s]} EARLY SHORT\nRally {d['rally']:.2f}%")
-            else:
-                lines.append(f"⚪ {NAMES[s]} no early 0.25% setup")
-        send_telegram("\n\n".join(lines + band_blocks(data)))
-        results["wednesday_sent"] = True
+    # Monday new week ≥ 00:30 UTC (crypto 24/7 — Monday candle exists)
+    if now.weekday() == 0 and now.hour >= 0 and now.minute >= 30 and not week["monday_sent"]:
+        if data:
+            send_telegram(monday_message(data))
+            week["monday_sent"] = True
+            week["opens"] = {sym: data[sym]["open"] for sym in data}
+            week["opens_meta"] = {
+                sym: {"monday_date": data[sym]["monday_date"], "venue": "binance"}
+                for sym in data
+            }
+            save_results(results)
+
+    opens = week.get("opens", {})
+    # rebuild opens keys if stored under name by old version — expect binance sym keys
+    if opens and not any(k.endswith("USDT") for k in opens):
+        # map name→sym
+        inv = {v: k for k, v in SYMBOLS.items()}
+        opens = {inv[n]: p for n, p in opens.items() if n in inv}
+        week["opens"] = opens
+
+    # Wednesday early 18:00–19:00 UTC
+    if now.weekday() == 2 and 18 <= now.hour < 19 and not week["wed_sent"]:
+        send_telegram(structure_block(data, "Wednesday early", opens))
+        week["wed_sent"] = True
         save_results(results)
 
-    if now.weekday() == 3 and now.hour >= 18 and not results["thursday_sent"]:
-        lines = [f"<b>{BOT_NAME} Thursday final</b>  official 0.25%"]
-        for s in SYMBOLS:
-            if s not in data:
+    # Thursday final 18:00–19:00 UTC (confirm)
+    if now.weekday() == 3 and 18 <= now.hour < 19 and not week["thu_sent"]:
+        send_telegram(structure_block(data, "Thursday final", opens))
+        for sym in SYMBOLS:
+            if sym not in data:
                 continue
-            d = data[s]
-            c = results["coins"][s]
-            if d["long_ok"]:
-                c["pending_long"] = True
-                c["pending_short"] = False
-                if c["entry"] is None:
-                    c["entry"] = d["close"]
-                lines.append(f"🟢 {NAMES[s]} LONG CONFIRMED\nDip {d['dip']:.2f}%")
-            elif d["short_ok"]:
-                c["pending_short"] = True
-                c["pending_long"] = False
-                if c["entry"] is None:
-                    c["entry"] = d["close"]
-                lines.append(f"🔴 {NAMES[s]} SHORT CONFIRMED\nRally {d['rally']:.2f}%")
-            else:
-                c["pending_long"] = False
-                c["pending_short"] = False
-                lines.append(f"⚪ {NAMES[s]} NO SETUP")
-        send_telegram("\n\n".join(lines + band_blocks(data)))
-        results["thursday_sent"] = True
+            o = opens.get(sym, data[sym]["open"])
+            side = band_side(o, data[sym]["low"], data[sym]["high"], OFFICIAL)
+            week.setdefault(sym, {})["thu_confirm"] = side
+            week[sym]["snapshot"] = {
+                "open": o,
+                "low": data[sym]["low"],
+                "high": data[sym]["high"],
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        week["thu_sent"] = True
         save_results(results)
 
-    if now.weekday() == 6 and now.hour >= 20 and not results["sunday_sent"]:
-        lines = [f"<b>{BOT_NAME} Sunday report</b>  0.25% live score"]
-        for s in SYMBOLS:
-            if s not in data:
-                continue
-            d = data[s]
-            c = results["coins"][s]
-            week_ret = (d["close"] - d["open"]) / d["open"] * 100
-            if c["pending_long"]:
-                c["long_total"] += 1
-                if d["close"] > d["open"]:
-                    c["long_wins"] += 1
-                note = "long live score updated"
-            elif c["pending_short"]:
-                c["short_total"] += 1
-                if d["close"] < d["open"]:
-                    c["short_wins"] += 1
-                note = "short live score updated"
-            else:
-                note = "no Thursday 0.25% setup"
-            c["pending_long"] = False
-            c["pending_short"] = False
-            lines.append(f"{NAMES[s]} week {week_ret:+.2f}%\n{note}\n{score_line(s)}")
-        send_telegram("\n\n".join(lines))
-        results["sunday_sent"] = True
+    # Sunday report ≥ 21:00 UTC
+    if now.weekday() == 6 and now.hour >= 21 and not week["sun_sent"]:
+        send_telegram(sunday_message(data, results, opens))
+        week["sun_sent"] = True
         save_results(results)
 
-print("Neo long+short + bands starting")
-send_telegram(
-    f"🤖 <b>{BOT_NAME} updated</b>\n"
-    "Official 0.25% + watch bands 0.50 / 0.75 / 1.00 (≥88%)\n"
-    "/status /score"
-)
+    # heartbeat telegram every HEARTBEAT_HOURS (silent file always)
+    meta = results.setdefault("meta", {})
+    last_hb = meta.get("last_hb_msg", 0)
+    if time.time() - last_hb > HEARTBEAT_HOURS * 3600:
+        # file heartbeat only — no spam unless you want it
+        meta["last_hb_msg"] = time.time()
+        save_results(results)
 
-last_check = 0
-while True:
-    poll_telegram()
-    if time.time() - last_check >= 20 * 60:
+    touch_heartbeat(ok=True, note=f"ok symbols={len(data)}")
+
+
+def main():
+    ensure_data_dir()
+    delete_webhook()
+    results = load_results()
+    save_results(results)
+    send_telegram(
+        f"🤖 <b>{BOT_NAME} is online 24/7</b>\n"
+        "Binance: BTC ETH BNB LTC DOGE SOL XRP\n"
+        "Mon open · Wed early 18:00 UTC · Thu final 18:00 UTC · Sun ≥21:00 UTC\n"
+        "Official 0.25% · /status /scores /bands /journal"
+    )
+    while True:
         try:
-            run_schedule()
+            results = load_results()
+            check_stale_heartbeat(results)
+            poll_commands(results)
+            run_once(results)
+            touch_heartbeat(ok=True)
         except Exception as e:
-            print("schedule error", e)
-        last_check = time.time()
-    time.sleep(3)
+            print("loop error", e)
+            try:
+                touch_heartbeat(ok=False, note=str(e))
+            except Exception:
+                pass
+        time.sleep(POLL_SLEEP)
+
+
+if __name__ == "__main__":
+    main()
+
