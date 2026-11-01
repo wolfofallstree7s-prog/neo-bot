@@ -49,7 +49,7 @@ EXTENDED_PCT = 5.0          # structure OK but already ran this much → EXTENDE
 SKIP_EXTENDED_PCT = 8.0     # no new risk language above this
 HEARTBEAT_HOURS = 6
 STALE_HOURS = 2
-POLL_SLEEP = 60
+POLL_SLEEP = 15  # faster /status /scores replies
 
 # Historical seeds (your research sample) — live book is separate
 HIST_SEED = {
@@ -217,6 +217,26 @@ def delete_webhook():
         )
     except Exception as e:
         print("deleteWebhook", e)
+
+
+def set_bot_commands():
+    """Telegram menu (the / button list)."""
+    commands = [
+        {"command": "status", "description": "Official 0.25% structure now"},
+        {"command": "scores", "description": "Hist + live win rates"},
+        {"command": "bands", "description": "All bands 0.25–1.00%"},
+        {"command": "journal", "description": "Last 5 scored setups"},
+        {"command": "help", "description": "Commands + schedule"},
+    ]
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/setMyCommands",
+            json={"commands": commands},
+            timeout=15,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        print("setMyCommands", e)
 
 
 # ─── Price data (Binance first, Yahoo fallback) ─────────────────────────────
@@ -735,6 +755,7 @@ def run_once(results):
 def main():
     ensure_data_dir()
     delete_webhook()
+    set_bot_commands()
     results = load_results()
     save_results(results)
     send_telegram(
