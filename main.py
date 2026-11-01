@@ -16,7 +16,7 @@ DATA_DIR = "/data"
 RESULTS_FILE = os.path.join(DATA_DIR, "results.json")
 HEARTBEAT_FILE = os.path.join(DATA_DIR, "heartbeat.json")
 
-# Binance spot symbols (what you actually trade)
+# Primary: Binance spot. Fallback: Yahoo (Railway often blocks Binance IPs)
 SYMBOLS = {
     "BTCUSDT": "BTC",
     "ETHUSDT": "ETH",
@@ -26,6 +26,22 @@ SYMBOLS = {
     "SOLUSDT": "SOL",
     "XRPUSDT": "XRP",
 }
+YAHOO_MAP = {
+    "BTCUSDT": "BTC-USD",
+    "ETHUSDT": "ETH-USD",
+    "BNBUSDT": "BNB-USD",
+    "LTCUSDT": "LTC-USD",
+    "DOGEUSDT": "DOGE-USD",
+    "SOLUSDT": "SOL-USD",
+    "XRPUSDT": "XRP-USD",
+}
+BINANCE_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://data-api.binance.vision",
+]
 
 OFFICIAL = 0.25
 BANDS = [0.25, 0.50, 0.75, 1.00]
@@ -178,27 +194,9 @@ def delete_webhook():
         print("deleteWebhook", e)
 
 
-# ─── Binance data ──────────────────────────────────────────────────────────
-
-def fetch_binance_klines(symbol: str, interval="1d", limit=14):
-    def _fetch():
-        url = "https://api.binance.com/api/v3/klines"
-        r = requests.get(
-            url,
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=25,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            raise ValueError(f"empty klines {symbol}")
-        return data
-
-    return retry(_fetch, tries=3, delay=2, label=f"binance {symbol}")
-
+# ─── Price data (Binance first, Yahoo fallback) ─────────────────────────────
 
 def kline_row(k):
-    # [open_time, open, high, low, close, ...]
     return {
         "open_time": int(k[0]),
         "open": float(k[1]),
@@ -208,65 +206,151 @@ def kline_row(k):
     }
 
 
+def fetch_binance_klines(symbol: str, interval="1d", limit=21):
+    last_err = None
+    for base in BINANCE_BASES:
+        try:
+            url = f"{base}/api/v3/klines"
+            r = requests.get(
+                url,
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code != 200:
+                last_err = f"{base} status {r.status_code}"
+                continue
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                last_err = f"{base} empty"
+                continue
+            return data, base
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"binance fail {symbol}: {last_err}")
+
+
+def fetch_yahoo_daily(yahoo_sym: str, limit=21):
+    from urllib.parse import quote
+
+    def _fetch():
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(yahoo_sym)}"
+        r = requests.get(
+            url,
+            params={"interval": "1d", "range": "1mo"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=25,
+        )
+        r.raise_for_status()
+        res = r.json()["chart"]["result"][0]
+        q = res["indicators"]["quote"][0]
+        ts = res["timestamp"]
+        rows = []
+        for i in range(len(ts)):
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+            if None in (o, h, l, c):
+                continue
+            rows.append({
+                "open_time": int(ts[i]) * 1000,
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+            })
+        if not rows:
+            raise ValueError(f"yahoo empty {yahoo_sym}")
+        return rows[-limit:]
+
+    return retry(_fetch, tries=3, delay=2, label=f"yahoo {yahoo_sym}")
+
+
+def rows_to_week(rows, monday_date):
+    by_day = {}
+    for row in rows:
+        d = datetime.fromtimestamp(row["open_time"] / 1000, tz=timezone.utc).date()
+        by_day[d] = row
+
+    if monday_date not in by_day:
+        candidates = [
+            d for d in by_day
+            if monday_date <= d <= monday_date + timedelta(days=6)
+        ]
+        if not candidates:
+            return None
+        mon_d = min(candidates)
+    else:
+        mon_d = monday_date
+
+    mon_open = by_day[mon_d]["open"]
+    highs, lows, last_close, last_ts = [], [], None, None
+    for i in range(7):
+        d = monday_date + timedelta(days=i)
+        if d in by_day:
+            highs.append(by_day[d]["high"])
+            lows.append(by_day[d]["low"])
+            last_close = by_day[d]["close"]
+            last_ts = by_day[d]["open_time"]
+    if not highs:
+        return None
+    return {
+        "open": mon_open,
+        "high": max(highs),
+        "low": min(lows),
+        "close": last_close,
+        "bar_ts": last_ts,
+        "monday_date": mon_d.isoformat(),
+    }
+
+
 def snapshot_week():
     """
-    For each symbol return week structure based on UTC daily candles.
-    Monday open = open of the Monday daily candle of current ISO week.
-    High/low = max/min from Monday through latest available daily bar
-    (in-progress today included — labeled in messages).
+    Weekly structure from daily candles.
+    Tries Binance first (several hosts), then Yahoo USD pairs.
     """
     now = datetime.now(timezone.utc)
     wk = week_key(now)
     monday_date = datetime.fromisoformat(wk).date()
     out = {}
     errors = []
+    venue_used = {}
 
     for sym, name in SYMBOLS.items():
+        got = None
+        venue = None
+        # 1) Binance
         try:
-            raw = fetch_binance_klines(sym, "1d", 21)
+            raw, base = fetch_binance_klines(sym, "1d", 21)
             rows = [kline_row(k) for k in raw]
-            # map by UTC date
-            by_day = {}
-            for row in rows:
-                d = datetime.fromtimestamp(row["open_time"] / 1000, tz=timezone.utc).date()
-                by_day[d] = row
-
-            if monday_date not in by_day:
-                # fallback: first candle on/after monday in this week
-                candidates = [d for d in by_day if d >= monday_date and d <= monday_date + timedelta(days=6)]
-                if not candidates:
-                    errors.append(name)
-                    continue
-                mon_d = min(candidates)
-            else:
-                mon_d = monday_date
-
-            mon_open = by_day[mon_d]["open"]
-            days = [monday_date + timedelta(days=i) for i in range(7)]
-            highs, lows, last_close, last_ts = [], [], None, None
-            for d in days:
-                if d in by_day:
-                    highs.append(by_day[d]["high"])
-                    lows.append(by_day[d]["low"])
-                    last_close = by_day[d]["close"]
-                    last_ts = by_day[d]["open_time"]
-            if not highs:
-                errors.append(name)
-                continue
-
-            out[sym] = {
-                "name": name,
-                "open": mon_open,
-                "high": max(highs),
-                "low": min(lows),
-                "close": last_close,
-                "bar_ts": last_ts,
-                "monday_date": mon_d.isoformat(),
-            }
+            got = rows_to_week(rows, monday_date)
+            if got:
+                venue = f"binance:{base.replace('https://', '')}"
         except Exception as e:
-            print("snapshot", sym, e)
-            errors.append(name)
+            print("binance", sym, e)
 
+        # 2) Yahoo fallback
+        if not got:
+            try:
+                ysym = YAHOO_MAP.get(sym)
+                if ysym:
+                    rows = fetch_yahoo_daily(ysym, 21)
+                    got = rows_to_week(rows, monday_date)
+                    if got:
+                        venue = "yahoo"
+            except Exception as e:
+                print("yahoo", sym, e)
+
+        if not got:
+            errors.append(name)
+            continue
+
+        got["name"] = name
+        got["venue"] = venue
+        out[sym] = got
+        venue_used[name] = venue
+
+    if venue_used:
+        print("venues", venue_used)
     return out, errors
 
 
@@ -652,4 +736,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
