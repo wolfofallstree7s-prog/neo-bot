@@ -1,10 +1,9 @@
 """
-Neo — crypto weekly structure alert bot (fixed)
+Neo — crypto weekly structure alert bot (v3: risk-to-invalidation, pullback/invalidation alerts, entry-stage stats)
 """
 import os
 import json
 import time
-import html
 import requests
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -43,6 +42,7 @@ BINANCE_BASES = [
 ]
 
 OFFICIAL = 0.25
+NEAR_OPEN_PCT = 0.15   # pullback alert zone around the open
 BANDS = [0.25, 0.50, 0.75, 1.00]
 EXTENDED_PCT = 5.0
 SKIP_EXTENDED_PCT = 8.0
@@ -52,9 +52,9 @@ POLL_SLEEP = 15
 SEND_HEARTBEAT_MSG = os.environ.get("HEARTBEAT_MSG", "0") == "1"
 
 # Schedule (UTC)
-MON_AT = (0, 30)     # Monday new-week note from 00:30
-MID_HOUR = 18        # Wed early / Thu final from 18:00 (catch-up all day)
-SUN_HOUR = 21        # Sunday report from 21:00
+MON_AT = (0, 30)
+MID_HOUR = 18
+SUN_HOUR = 21
 
 HIST_SEED = {
     "BTC":  {"long_w": 21, "long_n": 21, "short_w": 22, "short_n": 23},
@@ -124,6 +124,7 @@ def load_results():
 
     r.setdefault("weeks", {})
     r.setdefault("journal", [])
+    r.setdefault("stage", {})
     return r
 
 
@@ -140,7 +141,6 @@ def touch_heartbeat(ok=True, note=""):
 
 
 def check_stale_heartbeat(results):
-    """Fires once after a restart that follows a long gap (bot was down)."""
     hb = load_json(HEARTBEAT_FILE, {})
     ts = hb.get("ts")
     if not ts:
@@ -228,6 +228,7 @@ def set_bot_commands():
         {"command": "scores", "description": "Hist + live win rates"},
         {"command": "bands", "description": "All bands 0.25–1.00%"},
         {"command": "journal", "description": "Last 5 scored setups"},
+        {"command": "capture", "description": "Wed vs Thu entry stats"},
         {"command": "help", "description": "Commands + schedule"},
     ]
     try:
@@ -319,7 +320,7 @@ def rows_to_week(rows, monday_date):
     if not present:
         return None
 
-    mon_d = present[0]  # Monday, or first available day if Monday is missing
+    mon_d = present[0]
     last = by_day[present[-1]]
     return {
         "open": by_day[mon_d]["open"],
@@ -332,7 +333,6 @@ def rows_to_week(rows, monday_date):
 
 
 def snapshot_week():
-    """Binance first (several hosts), then Yahoo USD pairs."""
     now = datetime.now(timezone.utc)
     monday_date = datetime.fromisoformat(week_key(now)).date()
     out, errors, venue_used = {}, [], {}
@@ -407,6 +407,112 @@ def extension_note(o, lo, hi, side):
 
 def inv_prices(o):
     return o * (1 - OFFICIAL / 100), o * (1 + OFFICIAL / 100)
+
+
+def risk_to_inv(side, px, o):
+    inv_l, inv_s = inv_prices(o)
+    if side == "LONG":
+        return (px - inv_l) / px * 100
+    if side == "SHORT":
+        return (inv_s - px) / px * 100
+    return None
+
+
+def simulate(side, entry, o, lo, hi, close):
+    """Entry -> week end; exits at the invalidation line if it broke.
+    Ignores slippage and gaps through the line."""
+    inv_l, inv_s = inv_prices(o)
+    if side == "LONG":
+        stopped = lo < inv_l
+        exit_px = inv_l if stopped else close
+        return (exit_px - entry) / entry * 100, stopped
+    stopped = hi > inv_s
+    exit_px = inv_s if stopped else close
+    return (entry - exit_px) / entry * 100, stopped
+
+
+def record_stages(results, week, sym, name, o, lo, hi, close):
+    stage = results.setdefault("stage", {})
+    out = []
+    for st in ("wed", "thu"):
+        w = week.get(sym, {})
+        side, px = w.get(f"{st}_confirm"), w.get(f"{st}_px")
+        if side not in ("LONG", "SHORT") or not px or w.get(f"{st}_scored"):
+            continue
+        ret, stopped = simulate(side, px, o, lo, hi, close)
+        b = stage.setdefault(st, {}).setdefault(
+            name, {"n": 0, "w": 0, "stopped": 0, "sum_ret": 0.0})
+        b["n"] += 1
+        b["w"] += 1 if ret > 0 else 0
+        b["stopped"] += 1 if stopped else 0
+        b["sum_ret"] += ret
+        w[f"{st}_scored"] = True
+        out.append(f"{st.upper()}→end {ret:+.2f}%" + (" (stopped)" if stopped else ""))
+    return out
+
+
+def capture_message(results):
+    lines = [f"<b>{BOT_NAME} entry-stage stats</b>",
+             "<i>entry price → week end, stopped at the 0.25% line</i>"]
+    for st, label in (("wed", "Wed early"), ("thu", "Thu final")):
+        book = results.get("stage", {}).get(st, {})
+        n = sum(b["n"] for b in book.values())
+        if not n:
+            lines.append(f"{label}: no scored trades yet")
+            continue
+        w = sum(b["w"] for b in book.values())
+        s = sum(b["stopped"] for b in book.values())
+        r = sum(b["sum_ret"] for b in book.values())
+        lines.append(f"<b>{label}</b>: {w}/{n} win · {s} stopped · avg {r/n:+.2f}%")
+        for name, b in book.items():
+            if b["n"]:
+                lines.append(f"  {name} {b['w']}/{b['n']} avg {b['sum_ret']/b['n']:+.2f}%")
+    return "\n".join(lines)
+
+
+def check_live_alerts(results, week, data, opens, now):
+    changed = False
+    today = now.date().isoformat()
+    for sym, name in SYMBOLS.items():
+        if sym not in data:
+            continue
+        w = week.setdefault(sym, {})
+        o = _open_for(sym, data, opens)
+        lo, hi, px = data[sym]["low"], data[sym]["high"], data[sym]["close"]
+        inv_l, inv_s = inv_prices(o)
+
+        # 1) invalidation of an issued signal
+        sig = w.get("thu_confirm") if w.get("thu_confirm") in ("LONG", "SHORT") \
+            else w.get("wed_confirm")
+        if sig in ("LONG", "SHORT") and not w.get("inv_alerted"):
+            broke = lo < inv_l if sig == "LONG" else hi > inv_s
+            if broke:
+                line = inv_l if sig == "LONG" else inv_s
+                send_telegram(
+                    f"🛑 <b>{BOT_NAME}</b> {name} {sig} INVALIDATED\n"
+                    f"Crossed {fmt_p(line)} (open {fmt_p(o)}). Setup is dead."
+                )
+                w["inv_alerted"] = True
+                changed = True
+
+        # 2) pullback to the open while structure is still alive
+        if now.weekday() >= 1 and not w.get("inv_alerted") \
+                and w.get("pullback_day") != today:
+            side = band_side(o, lo, hi, OFFICIAL)
+            near = NEAR_OPEN_PCT / 100
+            hit = (side == "LONG" and inv_l < px <= o * (1 + near)) or \
+                  (side == "SHORT" and o * (1 - near) <= px < inv_s)
+            if hit:
+                risk = risk_to_inv(side, px, o)
+                send_telegram(
+                    f"🎯 <b>{BOT_NAME}</b> {name} {side} pullback to open\n"
+                    f"Price {fmt_p(px)} · open {fmt_p(o)}\n"
+                    f"Risk to invalidation {risk:.2f}%"
+                )
+                w["pullback_day"] = today
+                changed = True
+    if changed:
+        save_results(results)
 
 
 def fmt_p(x):
@@ -488,11 +594,13 @@ def structure_block(data, title, opens=None):
                 trade = "EXTENDED — half size / pullback only"
             elif tag == "SKIP_EXTENDED":
                 trade = "SKIP_EXTENDED — structure only, no new risk"
+            risk = risk_to_inv(side, data[sym]["close"], o)
             lines.append(
                 f"{icon} <b>{name}</b> {side}\n"
                 f"dip {dip:.2f}% | rally {rally:.2f}% | ext {ext:.2f}%\n"
                 f"STRUCTURE: {side} OK · TRADE: {trade}\n"
                 f"Inv L {fmt_p(inv_l)} · S {fmt_p(inv_s)}"
+                + (f"\nRisk to inv now {risk:.2f}%" if risk is not None else "")
             )
     lines.append(risk_footer())
     return "\n\n".join(lines)
@@ -568,7 +676,10 @@ def sunday_message(data, results, opens):
         else:
             note = "no Thursday 0.25% setup"
 
-        lines.append(f"{name} week {ret:+.2f}%\n{note}\n" + _book_line(name, hist, live))
+        extra = record_stages(results, week, sym, name, o,
+                              data[sym]["low"], data[sym]["high"], c)
+        tail = f"\n{' · '.join(extra)}" if extra else ""
+        lines.append(f"{name} week {ret:+.2f}%\n{note}{tail}\n" + _book_line(name, hist, live))
     return "\n\n".join(lines)
 
 
@@ -598,7 +709,7 @@ def journal_message(results):
 def help_message():
     return (
         f"<b>{BOT_NAME}</b>\n"
-        "/status · /scores · /bands · /journal\n\n" + schedule_text()
+        "/status · /scores · /bands · /journal · /capture\n\n" + schedule_text()
     )
 
 
@@ -634,7 +745,6 @@ def poll_commands(results):
 
     try:
         for upd in updates:
-            # Advance offset first so a failing command can never replay forever
             meta["tg_offset"] = upd["update_id"] + 1
             try:
                 msg = upd.get("message") or {}
@@ -660,6 +770,8 @@ def poll_commands(results):
                     send_telegram(bands_block(snap, opens))
                 elif cmd == "/journal":
                     send_telegram(journal_message(results))
+                elif cmd == "/capture":
+                    send_telegram(capture_message(results))
             except Exception as e:
                 print("command error", scrub(e))
     finally:
@@ -688,7 +800,6 @@ def run_once(results):
 
     has_data = bool(data)
 
-    # Lock in each symbol's open as soon as it exists (survives restarts)
     if has_data:
         opens = week.setdefault("opens", {})
         opens_meta = week.setdefault("opens_meta", {})
@@ -705,21 +816,26 @@ def run_once(results):
             save_results(results)
     opens = week.get("opens", {})
 
-    # Monday note from 00:30 UTC (catch-up all day)
     if (now.weekday() == 0 and (now.hour, now.minute) >= MON_AT
             and not week["monday_sent"] and has_data):
         send_telegram(monday_message(data))
         week["monday_sent"] = True
         save_results(results)
 
-    # Wednesday early (catch-up from 18:00 UTC)
+    # Wednesday early: also records the entry price for stage stats
     if (now.weekday() == 2 and now.hour >= MID_HOUR
             and not week["wed_sent"] and has_data):
         send_telegram(structure_block(data, "Wednesday early", opens))
+        for sym in SYMBOLS:
+            if sym in data:
+                o = _open_for(sym, data, opens)
+                week.setdefault(sym, {})["wed_confirm"] = band_side(
+                    o, data[sym]["low"], data[sym]["high"], OFFICIAL)
+                week[sym]["wed_px"] = data[sym]["close"]
         week["wed_sent"] = True
         save_results(results)
 
-    # Thursday final + store confirmations
+    # Thursday final
     if (now.weekday() == 3 and now.hour >= MID_HOUR
             and not week["thu_sent"] and has_data):
         send_telegram(structure_block(data, "Thursday final", opens))
@@ -735,10 +851,14 @@ def run_once(results):
                 "high": data[sym]["high"],
                 "ts": now.isoformat(),
             }
+            week[sym]["thu_px"] = data[sym]["close"]
         week["thu_sent"] = True
         save_results(results)
 
-    # Sunday report from 21:00 UTC
+    # Live alerts: invalidation + pullback to open
+    if has_data:
+        check_live_alerts(results, week, data, opens, now)
+
     if (now.weekday() == 6 and now.hour >= SUN_HOUR
             and not week["sun_sent"] and has_data):
         send_telegram(sunday_message(data, results, opens))
@@ -769,7 +889,7 @@ def main():
         f"🤖 <b>{BOT_NAME} is online 24/7</b>\n"
         "Binance (Yahoo fallback): BTC ETH BNB LTC DOGE SOL XRP\n"
         + schedule_text() + "\n"
-        "Official 0.25% · /status /scores /bands /journal"
+        "Official 0.25% · /status /scores /bands /journal /capture"
     )
     while True:
         try:
