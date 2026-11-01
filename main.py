@@ -470,6 +470,14 @@ def capture_message(results):
     return "\n".join(lines)
 
 
+def fmt_p(x):
+    if x >= 100:
+        return f"${x:,.2f}"
+    if x >= 1:
+        return f"${x:,.4f}"
+    return f"${x:,.6f}"
+
+
 def check_live_alerts(results, week, data, opens, now):
     changed = False
     today = now.date().isoformat()
@@ -513,14 +521,6 @@ def check_live_alerts(results, week, data, opens, now):
                 changed = True
     if changed:
         save_results(results)
-
-
-def fmt_p(x):
-    if x >= 100:
-        return f"${x:,.2f}"
-    if x >= 1:
-        return f"${x:,.4f}"
-    return f"${x:,.6f}"
 
 
 def asof_line():
